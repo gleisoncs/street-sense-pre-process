@@ -23,6 +23,7 @@ import logging
 from pathlib import Path
 from datetime import timezone
 
+import psycopg2
 from confluent_kafka import Consumer, Producer
 from dotenv import load_dotenv
 
@@ -40,63 +41,21 @@ log = logging.getLogger('pre-process-worker1')
 KAFKA_BROKERS = os.environ.get('KAFKA_BROKERS', 'localhost:9092')
 INPUT_TOPIC = os.environ.get('INPUT_TOPIC', 'filter1')
 OUTPUT_TOPIC = os.environ.get('OUTPUT_TOPIC', 'topic1')
-DEFAULT_MODEL = os.environ.get('DEFAULT_MODEL', 'train4/weights/best.pt')
+#DEFAULT_MODEL = os.environ.get('DEFAULT_MODEL', 'train4/weights/best.pt')
+DEFAULT_MODEL = os.environ.get('DEFAULT_MODEL', 'yolov8s_1280_b12_e200/weights/best.pt')
 
 # Fraction of GPS points that must fall inside the region. 1.0 = every point
 # (strict, the default per spec). Lower it to tolerate a few stray fixes.
 MIN_INSIDE_RATIO = float(os.environ.get('MIN_INSIDE_RATIO', '1.0'))
 
-# ---------------------------------------------------------------------------
-# Regions — boundary polygons as [(lat, lon), ...] (ray-casting containment).
-# Rectangular bounding boxes are good enough for a coarse city/state geofence;
-# swap in a finer polygon (e.g. an official boundary) per region as needed.
-# ---------------------------------------------------------------------------
-def _bbox(lat_min, lat_max, lon_min, lon_max):
-    return [(lat_min, lon_min), (lat_min, lon_max), (lat_max, lon_max), (lat_max, lon_min)]
-
-# Curitiba municipal boundary — approximate polygon (lat, lon), tracing the
-# elongated N–S shape of the city rather than a loose rectangle.
-CURITIBA = [
-    (-25.345, -49.355),  # NW
-    (-25.345, -49.270),  # N
-    (-25.360, -49.230),
-    (-25.385, -49.195),  # NE
-    (-25.430, -49.185),  # E
-    (-25.490, -49.190),
-    (-25.540, -49.205),  # SE
-    (-25.585, -49.230),
-    (-25.620, -49.270),  # S
-    (-25.640, -49.300),
-    (-25.635, -49.335),  # SW
-    (-25.600, -49.360),
-    (-25.545, -49.375),
-    (-25.480, -49.385),  # W
-    (-25.425, -49.380),
-    (-25.385, -49.372),
-]
-
-REGIONS = {
-    # city of Curitiba, Paraná, Brazil — approximate municipal boundary
-    'curitiba': CURITIBA,
-    # state of Paraná, Brazil (coarse bbox)
-    'parana':   _bbox(-26.72, -22.52, -54.62, -48.02),
-    'paraná':   _bbox(-26.72, -22.52, -54.62, -48.02),
+# Postgres holding the `regioes` table (osmnx boundary polygons).
+DB_CONFIG = {
+    'host':     os.environ.get('DB_HOST', 'localhost'),
+    'port':     int(os.environ.get('DB_PORT', 5432)),
+    'user':     os.environ.get('DB_USER', 'admin'),
+    'password': os.environ.get('DB_PASSWORD', 'senha123'),
+    'dbname':   os.environ.get('DB_NAME', 'mybank'),
 }
-
-
-def point_in_polygon(lat: float, lon: float, polygon) -> bool:
-    """Ray-casting point-in-polygon. polygon: list of (lat, lon) vertices."""
-    inside = False
-    n = len(polygon)
-    j = n - 1
-    for i in range(n):
-        lat_i, lon_i = polygon[i]
-        lat_j, lon_j = polygon[j]
-        if ((lon_i > lon) != (lon_j > lon)) and \
-           (lat < (lat_j - lat_i) * (lon - lon_i) / (lon_j - lon_i) + lat_i):
-            inside = not inside
-        j = i
-    return inside
 
 
 # ---------------------------------------------------------------------------
@@ -143,17 +102,62 @@ def extract_gps_points(video_path: str):
 
 
 def track_inside_region(points, region_name: str):
-    """(passed, inside, total) — does the track map-match the named region?"""
-    polygon = REGIONS.get(region_name.lower().strip())
-    if polygon is None:
-        log.error(f'[REGION] região desconhecida: "{region_name}" '
-                  f'(conhecidas: {", ".join(sorted(REGIONS))})')
-        return False, 0, len(points)
+    """(passed, inside, total, label) — map-match the track against the named
+    region using the `regioes` table (PostGIS ST_Contains, real OSM polygons).
 
-    inside = sum(1 for lat, lon in points if point_in_polygon(lat, lon, polygon))
-    total = len(points)
-    ratio = inside / total if total else 0.0
-    return ratio >= MIN_INSIDE_RATIO, inside, total
+    The region name is matched against the bairro, or the city when there is no
+    bairro (so 'curitiba' -> city row, 'campina do siqueira' -> bairro row).
+    """
+    conn = psycopg2.connect(**DB_CONFIG)
+    try:
+        cur = conn.cursor()
+        # Match the region name against each row's OWN identifying name (the
+        # field named by its tipo), accent- and case-insensitive — so 'parana'
+        # matches the estado row, not a bairro that merely sits in Paraná.
+        cur.execute(
+            """
+            SELECT id, cidade, bairro, estado
+            FROM regioes
+            WHERE unaccent(lower(%(q)s)) = unaccent(lower(
+                CASE tipo
+                    WHEN 'bairro' THEN bairro
+                    WHEN 'cidade' THEN cidade
+                    WHEN 'estado' THEN estado
+                END
+            ))
+            ORDER BY (tipo = 'bairro') DESC, (tipo = 'cidade') DESC
+            LIMIT 1
+            """,
+            {'q': region_name.strip()},
+        )
+        row = cur.fetchone()
+        if not row:
+            log.error(f'[REGION] região desconhecida na tabela regioes: "{region_name}"')
+            return False, 0, len(points), None
+
+        region_id, cidade, bairro, estado = row
+        label = bairro or cidade or estado
+
+        lons = [lon for _lat, lon in points]
+        lats = [lat for lat, _lon in points]
+        cur.execute(
+            """
+            SELECT
+                count(*) FILTER (
+                    WHERE ST_Contains(r.geom, ST_SetSRID(ST_MakePoint(p.lon, p.lat), 4326))
+                ) AS inside,
+                count(*) AS total
+            FROM regioes r,
+                 unnest(%s::float8[], %s::float8[]) AS p(lon, lat)
+            WHERE r.id = %s
+            """,
+            (lons, lats, region_id),
+        )
+        inside, total = cur.fetchone()
+        ratio = inside / total if total else 0.0
+        return ratio >= MIN_INSIDE_RATIO, inside, total, label
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +166,7 @@ def track_inside_region(points, region_name: str):
 def start_worker1():
     log.info('=' * 60)
     log.info('      PRE-PROCESS WORKER 1: GEOFENCE / MAP-MATCHING')
-    log.info(f'  {INPUT_TOPIC} -> {OUTPUT_TOPIC} | regions: {", ".join(sorted(REGIONS))}')
+    log.info(f'  {INPUT_TOPIC} -> {OUTPUT_TOPIC} | regions from table "regioes" @ {DB_CONFIG["host"]}')
     log.info('=' * 60)
 
     consumer = Consumer({
@@ -206,16 +210,16 @@ def start_worker1():
                 consumer.commit(msg)
                 continue
 
-            passed, inside, total = track_inside_region(points, region)
+            passed, inside, total, label = track_inside_region(points, region)
             if not passed:
-                log.info(f'[DROP] {media} — fora de "{region}" ({inside}/{total} pontos dentro)')
+                log.info(f'[DROP] {media} — fora de "{label or region}" ({inside}/{total} pontos dentro)')
                 consumer.commit(msg)
                 continue
 
             out = json.dumps({'media': media, 'model': model})
             producer.produce(OUTPUT_TOPIC, value=out.encode('utf-8'))
             producer.flush()
-            log.info(f'[PASS] {media} dentro de "{region}" ({inside}/{total}) -> {OUTPUT_TOPIC}: {out}')
+            log.info(f'[PASS] {media} dentro de "{label}" ({inside}/{total}) -> {OUTPUT_TOPIC}: {out}')
             consumer.commit(msg)
 
     except KeyboardInterrupt:

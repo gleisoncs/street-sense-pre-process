@@ -1,3 +1,4 @@
 confluent-kafka
 python-dotenv
 gopro-overlay
+psycopg2-binary
